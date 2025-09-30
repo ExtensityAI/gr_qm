@@ -7,7 +7,7 @@ Comprehensive, reproducible code to study how short‑distance, UV‑regular bla
 
 If you want a one‑shot demo, see the commands under “Run the Experiments”.
 
-## Papers‑with‑Code Style Summary
+## Summary
 
 - Task: Constrain a UV‑regular core scale `L` (or fractional size `ε = L/r_s`) using BH ringdown (220) frequencies and damping times, cross‑checked by analytic limits (eikonal) and semi‑analytic wave computations (WKB), with time‑domain validation and a hierarchical posterior across multiple GW events.
 - Method: Model a one‑scale interior via `m(r) = M r^3/(r^3 + L^3)`, derive eikonal shifts `δΩ/Ω`, compute wave QNMs from WKB1/3 using barrier derivatives at the deformed peak, and validate with time‑domain Regge–Wheeler evolutions. Build per‑event residuals against GR fits (Berti–Nakano) and infer posteriors on `ε` and on absolute `L0` via a simple likelihood with optional slope systematics and start‑time mixtures.
