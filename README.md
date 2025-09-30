@@ -1,9 +1,7 @@
 # UV‑Saturated Regular‑Core Black Holes: Ringdown, Eikonal/WKB, and Hierarchical Inference
 
-<video width="900" controls>
-  <source src="https://youtu.be/ONgwK0xHVCE" type="video/mp4">
-  Your browser does not support the video tag.
-</video>
+[<img src="./assets/extensity-wallpaper.png" width="900"
+  alt="Extensity AI Logo"/>](https://youtu.be/ONgwK0xHVCE)
 
 Comprehensive, reproducible code to study how short‑distance, UV‑regular black‑hole cores modify quasinormal modes (QNMs) and related observables, and to infer bounds from gravitational‑wave ringdown and ancillary data. The code focuses on a one‑scale Hayward‑like mass profile and small‑core expansions, with both geodesic (eikonal) and wave‑based (WKB and time‑domain) validations, plus a lightweight hierarchical analysis for LVK O3b.
 
