@@ -115,8 +115,16 @@ Note: The CF API in `tests/test_schwarzschild_qnm.py` assumes a convenience func
 
 ## Citation
 
-If you use this repository in academic work, please cite the associated manuscript (see `Ringdown_Bound_paper.pdf`) and, where appropriate, the original QNM/CF/WKB references used in the code (Leaver 1985; Berti–Cardoso–Will 2009; Schutz–Will 1985; Iyer–Will 1987).
+If you use this repository in academic work, please cite the associated manuscript
 
-## License
+```bibtex
+@misc{Dinu_Ringdown_2025,
+  author = {Dinu, Marius-Constantin},
+  title = {{Ringdown Bounds on UV-Regularized Black-Hole Cores}},
+  url = {https://github.com/ExtensityAI/gr_qm},
+  month = {10},
+  year = {2025}
+}
+```
 
-See the repository for licensing terms. All generated data under `data/` and `figures/` are derived artifacts.
+and, where appropriate, the original QNM/CF/WKB references used in the code (Leaver 1985; Berti–Cardoso–Will 2009; Schutz–Will 1985; Iyer–Will 1987).
