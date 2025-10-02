@@ -28,6 +28,7 @@ Resuming:
 """
 
 import os, math, json, glob, subprocess, random
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 from typing import Optional, List
 from pathlib import Path
 import numpy as np
@@ -166,6 +167,26 @@ NEBULA_FLOW_RATE  = 0.06 # cycles/s: UV scroll speed for clouds (gives overall f
 WARP_TIME_RATE    = 0.25 # rate for time-varying domain-warp fields (adds evolving detail)
 TWINKLE_RATE      = 0.50 # Hz: star brightness modulation (tiny twinkle so they feel alive)
 
+# --- Shadow/capture controls ---
+HORIZON_PRESENT = True           # default: physical BH (use analytic capture cone)
+ENABLE_CAPTURE_CONE_LOCK = True  # keep True for science-correct shadow sizing
+
+# ========= Comments on defaults =========
+# For paper figures: ENABLE_PHOTON_RING=False, VORTEX_STRENGTH=0.0, BLOOM_GAIN≈0.4–0.6
+
+# ======== Cinematic tweaks ========
+# --- AOVs & export (off by default) ---
+ENABLE_AOVS   = True     # compute AOVs in-memory and expose via AOVS_LAST
+WRITE_AOVS    = False    # if True, save AOVs to disk alongside frames
+AOVS_DIRNAME  = "aovs"   # folder inside OUT_ROOT
+AOVS_LAST = None         # updated each render if ENABLE_AOVS=True
+
+# Order (subring) detection — gate around the light ring
+ORDER_GATE_COEF = 1.25   # r_gate = ORDER_GATE_COEF * (3M); 1.2–1.4 works well
+
+# --- Photon ring irregularity controls (cinematic, subtle by default) ---
+PHOTON_RING_AZ_IRREG  = 0.22  # low-frequency azimuthal gain modulation
+PHOTON_RING_GAIN_NOISE = 0.18 # high-frequency noisy modulation of gain
 
 # ========= Audio =========
 def make_ringdown_wav(path, dur):
@@ -313,8 +334,8 @@ def horizon_radius_float() -> float:
         r = r_min + (r_max - r_min) * (k / Nscan)
         f = _f_horizon(r)
         if prev_f * f <= 0.0:  # sign change (or exact zero)
+            # DO NOT break; keep the last bracket to capture the OUTER horizon
             r_lo, r_hi = prev_r, r
-            break
         prev_r, prev_f = r, f
 
     if r_lo is None:
@@ -523,9 +544,10 @@ def render_frame_torch(width, height, time_s, device):
     need    = r_out / max(t_plane, 1e-6)
     FOV_eff = max(BASE_FOV, 2.0*math.atan((1.0 + FIT_MARGIN) * need))
 
+    # Report once
+    bc = photon_ring_b_critical()
     if time_s == 0.0:
         eps_eff = (core_length_L()/rs) if rs > 0 else 0.0
-        bc = photon_ring_b_critical()
         print(
             f"FOV_eff: {math.degrees(FOV_eff):.2f}°, "
             f"cam=({cam[0]:.2f},{cam[1]:.2f},{cam[2]:.2f}), "
@@ -535,12 +557,22 @@ def render_frame_torch(width, height, time_s, device):
             flush=True,
         )
 
+    # Screen-space ray directions
     ys = torch.linspace(-math.tan(FOV_eff/2),        math.tan(FOV_eff/2),        height, device=device)
     xs = torch.linspace(-math.tan(FOV_eff/2)*aspect, math.tan(FOV_eff/2)*aspect, width,  device=device)
     YY, XX = torch.meshgrid(ys, xs, indexing="ij")
 
     img_accum = torch.zeros((height, width, 3), device=device)
     r_min     = torch.full((height, width), 1e9, device=device)
+
+    # AOV accumulators
+    if ENABLE_AOVS:
+        aov_capture_cone = torch.zeros((height, width), dtype=torch.bool, device=device)
+        aov_escape       = torch.zeros((height, width), device=device)  # float ok
+        aov_order_n      = torch.zeros((height, width), dtype=torch.int16, device=device)
+
+    r_ph = 3.0 * BH_M                              # light-ring radius (outer, Schwarzschild-like)
+    r_gate = ORDER_GATE_COEF * r_ph                # region to count near-passes
 
     for _ in range(max(1, SAMPLES_PER_PIXEL)):
         # Primary rays
@@ -550,34 +582,68 @@ def render_frame_torch(width, height, time_s, device):
             + up.view(1,1,3)*YY.unsqueeze(-1)
         )
 
-        # Impact parameter & azimuth at the camera (constant along the geodesic)
+        # Impact parameter at the camera & azimuth (used by overlays)
         b0 = tnorm(torch.cross(cam.view(1,1,3), dir_world), dim=-1)
         phi_cam = torch.atan2(dir_world[...,1], dir_world[...,0])
+
+        # === Analytic capture cone (outer unstable photon sphere) ===
+        cone_cap = torch.zeros((height, width), dtype=torch.bool, device=device)
+        if ENABLE_CAPTURE_CONE_LOCK and HORIZON_PRESENT:
+            cone_cap = (b0 <= bc)
+            if ENABLE_AOVS:
+                aov_capture_cone |= cone_cap
 
         # Ray-march setup
         x = cam.view(1,1,3).expand(height, width, 3).clone()
         u = dir_world.clone()
 
+        # States
         alive   = torch.ones((height, width), device=device, dtype=torch.bool)
         hitmask = torch.zeros_like(alive)
         bhmask  = torch.zeros_like(alive)
+
+        # Pixels analytically inside the cone are "captured" and don't need marching
+        if HORIZON_PRESENT:
+            bhmask |= cone_cap
+            alive   &= (~cone_cap)
+
         inten   = torch.zeros((height, width), device=device)
         z_prev  = x[...,2].clone()
+        r_prev  = tnorm(x, dim=-1)                 # for order counting
+        was_dec = torch.zeros_like(alive)          # was decreasing r?
 
+        # Geometric marcher
         for _step in range(MAX_STEPS):
+            adv = alive & (~hitmask)
+            if not adv.any():
+                break
+
             z = x[...,2]
             r_here = tnorm(x, dim=-1)
 
-            # Horizon capture
-            fell = (r_here < r_h) & alive
+            # Horizon capture by march
+            fell = (r_here < r_h) & adv
             if fell.any():
                 bhmask[fell] = True
                 alive[fell]  = False
 
+            # --- order_n: count local minima of r inside r_gate ---
+            if ENABLE_AOVS:
+                dr = r_here - r_prev
+                dec = (dr < 0.0)
+                inc = (dr > 0.0)
+                # turning point: was decreasing and now increasing while near the ring
+                turn = was_dec & inc & (r_prev < r_gate) & adv
+                if turn.any():
+                    aov_order_n[turn] += 1
+                # update trackers only for active rays
+                was_dec = (dec & adv) | (was_dec & adv & (~inc))
+                r_prev = r_here
+
             r_min = torch.minimum(r_min, r_here)
 
-            # Detect crossing of the disk plane z=0 and shade the disk
-            cross = (z_prev > 0.0) & (z <= 0.0) & alive & (~hitmask)
+            # Disk plane z=0 intersection & shading
+            cross = (z_prev > 0.0) & (z <= 0.0) & adv & (~hitmask)
             if cross.any():
                 t0  = z_prev[cross] / (z_prev[cross] - z[cross] + 1e-12)
                 xi  = x[cross] - u[cross] * H_STEP * (1.0 - t0).unsqueeze(-1)
@@ -591,6 +657,7 @@ def render_frame_torch(width, height, time_s, device):
                     hitmask[idx[:,0], idx[:,1]] = True
                     alive[idx[:,0], idx[:,1]]   = False
 
+            # Advance only remaining rays
             adv = alive & (~hitmask)
             if not adv.any():
                 break
@@ -604,12 +671,12 @@ def render_frame_torch(width, height, time_s, device):
             u[adv] = ua; x[adv] = xa
             z_prev = z
 
-        # Add disk emission (warm colormap)
+        # Add disk emission
         if inten.max() > 0:
             I_norm = inten / (inten.max() + 1e-6)
             img_accum += warm_colormap(I_norm, device)
 
-        # Sample background for all misses (nebula, stars)
+        # Background for misses, but never for captured pixels
         miss = (~hitmask) & (~bhmask)
         if miss.any():
             d_sky = sky_sample_dirs(u, cam, time_s)
@@ -618,40 +685,47 @@ def render_frame_torch(width, height, time_s, device):
             stars *= (1.0 - 0.45*neb_a).unsqueeze(-1)
             bg = neb_a.unsqueeze(-1) * neb_col + grains + stars
             img_accum[miss] += bg[miss]
+            if ENABLE_AOVS:
+                aov_escape[miss] = 1.0  # escaped to infinity / background
 
-        # Photon-ring overlay AFTER bg so it blends with the scene
+        # Photon-ring overlay with irregular azimuthal modulation
         if ENABLE_PHOTON_RING:
-            bc = photon_ring_b_critical()
             base_sigma = PHOTON_RING_SIGMA_COEF * BH_M
-
-            # small thickness jitter around circumference
             nphi = noise2(phi_cam*64.0 + 13.7 + 0.017*_SEED_F,
                           phi_cam*64.0 + 29.3 + 0.019*_SEED_F)
             sigma = base_sigma * (1.0 + PHOTON_RING_NOISE * (2.0*nphi - 1.0))
-
-            # gaussian core in impact-parameter space
             core = torch.exp(-0.5 * ((b0 - bc) / (sigma + 1e-6))**2)
-
-            # soft-knee feather
             alpha = torch.clamp(core, 0.0, 1.0) ** PHOTON_RING_SOFTKNEE
 
-            # subtle warm highlight, but mostly borrow color from what's already there
+            # Azimuthal & noisy gain modulation (subtle by default)
+            phase1 = 0.37 + 0.000021*_SEED_F
+            phase2 = 1.11 + 0.000017*_SEED_F
+            phase3 = 2.67 + 0.000013*_SEED_F
+            lf = 1.0 + PHOTON_RING_AZ_IRREG * (
+                0.50*torch.cos(phi_cam + phase1) +
+                0.30*torch.cos(2.0*phi_cam + phase2) +
+                0.20*torch.cos(3.0*phi_cam + phase3)
+            )
+            az01 = (phi_cam/(2*math.pi) + 0.5)
+            hf = 1.0 + PHOTON_RING_GAIN_NOISE * (2.0*noise2(az01*192.0 + 31.7 + 0.013*_SEED_F,
+                                                            az01*137.0 + 47.1 + 0.017*_SEED_F) - 1.0)
+            gain_field = torch.clamp(lf * hf, 0.0, 2.0)
+
             warm = warm_colormap(core, device)
             tint = torch.tensor(PHOTON_RING_TINT, device=device).view(1,1,3)
             highlight = warm * tint
-
-            # color that tracks the local background
-            ring_rgb = PHOTON_RING_GAIN * alpha.unsqueeze(-1) * (
+            ring_rgb = (PHOTON_RING_GAIN * gain_field).unsqueeze(-1) * alpha.unsqueeze(-1) * (
                 PHOTON_RING_BG_MIX * img_accum + (1.0 - PHOTON_RING_BG_MIX) * highlight
             )
-
-            # SCREEN blend: out = 1 - (1 - base) * (1 - ring)
             img_accum = 1.0 - (1.0 - img_accum) * (1.0 - ring_rgb)
 
-    # Force the captured region black
-    img_accum[(r_min <= r_h + 1e-3)] = 0.0
+    # Final black pass:
+    final_black = bhmask.clone()
+    if HORIZON_PRESENT:
+        final_black |= (r_min <= r_h + 1e-3)
+    img_accum[final_black] = 0.0
 
-    # Post-process: normalize, bloom, gamma
+    # Post-process
     img_np = img_accum.detach().clamp(0, None).cpu().numpy()
     m = img_np.max()
     if m > 0:
@@ -661,6 +735,16 @@ def render_frame_torch(width, height, time_s, device):
         bright[..., c] = gaussian_filter(bright[..., c], BLOOM_SIGMA)
     img_np = np.clip(img_np + BLOOM_GAIN * bright, 0, 1)
     img_np = np.power(img_np, 1.0/max(GAMMA, 1e-6))
+
+    # Expose AOVs without breaking the return type
+    if ENABLE_AOVS:
+        global AOVS_LAST
+        AOVS_LAST = {
+            "mask_capture_cone": aov_capture_cone.detach().float().cpu().numpy(),  # cast here
+            "mask_escape":       aov_escape.detach().float().cpu().numpy(),
+            "order_n":           aov_order_n.detach().cpu().numpy(),
+        }
+
     return (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
 
 # ========= Metadata / Progress =========
@@ -766,6 +850,31 @@ def write_progress(total_frames, completed_indices):
             "completed": len(completed_indices),
             "done_indices": sorted(int(i) for i in completed_indices)}
     PROGRESS_JSON.write_text(json.dumps(data, indent=2))
+
+def _save_aov_png(path, arr01):
+    arr = np.clip(arr01, 0.0, 1.0)
+    iio.imwrite(path, (arr * 255).astype(np.uint8))
+
+def save_aovs(index: int):
+    if not WRITE_AOVS or AOVS_LAST is None:
+        return
+    out_dir = OUT_ROOT / AOVS_DIRNAME
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # masks are 0/1; order_n is small integer -> visualize as 0..6 normalized
+    _save_aov_png((out_dir / f"mask_capture_cone_{index:04d}.png").as_posix(),
+                  AOVS_LAST["mask_capture_cone"])
+    _save_aov_png((out_dir / f"mask_escape_{index:04d}.png").as_posix(),
+                  AOVS_LAST["mask_escape"])
+
+    max_vis_order = max(1, int(AOVS_LAST["order_n"].max()))
+    vis = np.clip(AOVS_LAST["order_n"] / float(max(6, max_vis_order)), 0.0, 1.0)
+    _save_aov_png((out_dir / f"order_n_{index:04d}.png").as_posix(), vis)
+
+    # also drop raw arrays for analysis
+    np.save((out_dir / f"mask_capture_cone_{index:04d}.npy").as_posix(), AOVS_LAST["mask_capture_cone"])
+    np.save((out_dir / f"mask_escape_{index:04d}.npy").as_posix(), AOVS_LAST["mask_escape"])
+    np.save((out_dir / f"order_n_{index:04d}.npy").as_posix(), AOVS_LAST["order_n"])
 
 # ========= Orchestration =========
 def main():
