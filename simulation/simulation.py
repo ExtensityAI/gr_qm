@@ -90,6 +90,21 @@ BH_M  = BASE_M * BH_SIZE_SCALE  # gravitating mass used for bending/horizon/phot
 rs    = 2.0 * BH_M       # Schwarzschild radius (event horizon radius)
 r_h   = 1.001 * rs       # small safety margin above horizon for capture test
 
+# ========= Core deformation =========
+ENABLE_CORE_DEFORMATION = True    # turn on to use your UV-regular core model
+
+# Choose how to specify L (core size):
+CORE_MODEL   = "fractional"       # "fractional" (L = eps * rs) or "absolute" (L = CORE_L0)
+# If CORE_MODEL == "fractional" then CORE_EPSILON is used; otherwise CORE_L0.
+CORE_EPSILON = 0.05               # eps = L/rs (use e.g. 0.05 .. 0.14 within small-def regime)
+# Sensible absolute-length default:
+# With BASE_M=1 and BH_SIZE_SCALE=3 ⇒ rs=6; CORE_L0=0.30 gives eps≈0.05 (small & safe).
+CORE_L0      =  0.30 * BASE_M     # absolute L in scene units (same units as BASE_M)
+
+# Cubic-response coefficients for QNM/audio coupling (Table I in the paper).
+CORE_CF   = 0.248                 # fractional frequency shift coeff (δf/f = CORE_CF * (L/rs)^3).
+CORE_CTAU = 0.608                 # fractional damping-time shift coeff (δτ/τ = CORE_CTAU * (L/rs)^3).
+
 # ========= Scene =========
 r_cam = 50.0 * BASE_M    # camera distance from origin along +z after tilt
 INCL  = math.radians(58) # camera tilt (radians) toward the disk plane
@@ -108,9 +123,15 @@ H_STEP    = 0.03         # integration step size (smaller = more accurate, slowe
 EPS       = 1e-9         # numerical epsilon to avoid division by zero
 
 # Photon ring overlay (optional cinematic boost around critical impact parameter)
-ENABLE_PHOTON_RING     = False   # True to add a stylized glow near the photon ring
+ENABLE_PHOTON_RING     = True    # True to add a stylized glow near the photon ring
 PHOTON_RING_SIGMA_COEF = 0.15    # thickness of that glow: sigma = coef * BH_M
 PHOTON_RING_GAIN       = 0.8     # strength of the glow contribution
+
+# --- blending refinements ---
+PHOTON_RING_SOFTKNEE = 0.65      # 0..1: raise mask^softknee (smaller = softer)
+PHOTON_RING_NOISE    = 0.12      # 0..~0.3: thickness jitter around circumference
+PHOTON_RING_BG_MIX   = 0.65      # 0..1: how much to pull color from underlying img
+PHOTON_RING_TINT     = [1.00, 0.96, 0.88]  # warmish highlight tint, subtle
 
 # Bloom (highlights glow post-process)
 BLOOM_THRESH  = 0.35     # bright-pass threshold in [0,1]
@@ -150,7 +171,16 @@ TWINKLE_RATE      = 0.50 # Hz: star brightness modulation (tiny twinkle so they 
 def make_ringdown_wav(path, dur):
     fs = 44100
     t  = np.linspace(0, dur, int(fs*dur), endpoint=False)
-    f_qnm = 254.6; tau = 0.00451 * 70.0
+
+    # Baselines
+    f0   = 254.6
+    tau0 = 0.00451 * 70.0
+
+    # Fractional cubic shifts from the paper: (δf/f, δτ/τ) = (CF, CTAU) * (L/rs)^3
+    eps = (core_length_L()/rs) if (ENABLE_CORE_DEFORMATION and rs > 0.0) else 0.0
+    f_qnm = f0  * (1.0 + CORE_CF   * (eps**3))
+    tau   = tau0 * (1.0 + CORE_CTAU * (eps**3))
+
     wave  = np.zeros_like(t)
     for tc in np.arange(0.0, dur, 1.25):
         dt  = np.clip(t - tc, 0, None)
@@ -160,6 +190,7 @@ def make_ringdown_wav(path, dur):
     wave  = np.tanh(1.35*wave)
     wave /= np.max(np.abs(wave)) + 1e-9
     write(path, fs, (0.92*wave*32767).astype(np.int16))
+    return f_qnm, tau
 
 # ========= Torch helpers =========
 def tnorm(v, dim=-1, keepdim=False):
@@ -170,13 +201,30 @@ def rotation_x(theta, device):
     c, s = math.cos(theta), math.sin(theta)
     return torch.tensor([[1.0,0.0,0.0],[0.0,c,-s],[0.0,s,c]], device=device, dtype=torch.float32)
 
-# weak-field index
-def n_of_r(r):  return 1.0 + rs / torch.clamp(r, min=1e-6)
-def grad_n(x):
-    r = tnorm(x, dim=-1)
-    dn_dr = -rs / torch.clamp(r*r, min=1e-6)
-    return (dn_dr / torch.clamp(r, min=1e-6)).unsqueeze(-1) * x
+# weak-field index using variable mass m(r): n(r) ≈ 1 + 2 m(r) / r
+def n_of_r(r):
+    r_safe = torch.clamp(r, min=1e-6)
+    if ENABLE_CORE_DEFORMATION:
+        return 1.0 + 2.0 * m_of_r(r_safe) / r_safe
+    else:
+        return 1.0 + rs / r_safe
 
+def grad_n(x):
+    """
+    ∇n = (dn/dr) r̂ with n(r)=1+2m(r)/r:
+    dn/dr = 2 [ m'(r) r - m(r) ] / r^2.
+    """
+    r = tnorm(x, dim=-1)
+    r_safe = torch.clamp(r, min=1e-6)
+    if ENABLE_CORE_DEFORMATION:
+        mr   = m_of_r(r_safe)
+        mpr  = dm_dr(r_safe)
+        dn_dr = 2.0 * (mpr * r_safe - mr) / (r_safe**2 + 1e-12)
+    else:
+        dn_dr = -rs / (r_safe**2)
+    return (dn_dr / r_safe).unsqueeze(-1) * x
+
+# ========= Camera =========
 def make_camera(device):
     y_off = -r_cam * math.tan(INCL)
     cam   = torch.tensor([0.0, y_off, r_cam], device=device, dtype=torch.float32)
@@ -186,6 +234,128 @@ def make_camera(device):
     up    = normalize(torch.cross(right, fwd))
     fwd   = normalize(fwd); right = normalize(right)
     return cam, right, up, fwd
+
+def core_length_L() -> float:
+    """Return L in scene units."""
+    if not ENABLE_CORE_DEFORMATION:
+        return 0.0
+    if CORE_MODEL == "absolute":
+        return float(CORE_L0)
+    return float(CORE_EPSILON) * rs  # fractional model
+
+def m_of_r(r):
+    """
+    Hayward-type mass profile m(r) = M r^3/(r^3 + L^3).
+    r can be a torch tensor or float.
+    """
+    M = BH_M
+    L = core_length_L()
+    if L <= 0.0:
+        # no deformation
+        return (torch.as_tensor(M, dtype=torch.float32, device=r.device)
+                if torch.is_tensor(r) else M)
+    if torch.is_tensor(r):
+        return M * (r**3) / (r**3 + L**3 + 1e-12)
+    else:
+        return M * (r**3) / (r**3 + L**3 + 1e-12)
+
+def dm_dr(r):
+    """Derivative of Hayward mass profile: 3 M L^3 r^2 / (r^3 + L^3)^2."""
+    M = BH_M
+    L = core_length_L()
+    if L <= 0.0:
+        return torch.zeros_like(r) if torch.is_tensor(r) else 0.0
+    if torch.is_tensor(r):
+        return (3.0 * M * (L**3) * (r**2)) / ((r**3 + L**3 + 1e-12)**2)
+    else:
+        return (3.0 * M * (L**3) * (r**2)) / ((r**3 + L**3 + 1e-12)**2)
+
+def photon_ring_b_critical() -> float:
+    """
+    b_c ≈ 3√3 M * [1 + (8/27)(L/rs)^3] (cubic response, compact core).
+    Falls back to Schwarzschild when L=0.
+    """
+    base = 3.0 * math.sqrt(3.0) * BH_M
+    L = core_length_L()
+    if L <= 0.0 or rs <= 0.0:
+        return base
+    eps = L / rs
+    return base * (1.0 + (8.0/27.0) * (eps**3))
+
+def _f_horizon(r: float) -> float:
+    """f(r) = 1 - 2 m(r) / r using float arithmetic (for root find)."""
+    M = BH_M
+    L = core_length_L()
+    if L <= 0.0:
+        # pure Schwarzschild
+        return 1.0 - 2.0*M / max(r, 1e-12)
+    # m(r) = M r^3/(r^3 + L^3)  ⇒ 2 m(r)/r = 2M r^2/(r^3 + L^3)
+    return 1.0 - (2.0*M * (r*r)) / (r**3 + L**3 + 1e-18)
+
+def horizon_radius_float() -> float:
+    """
+    Find outer horizon r_+ solving f(r)=0. Robust bracket + bisection.
+    If not found (no horizon), fall back to ~2M to preserve visuals.
+    """
+    M = BH_M
+    # Quick exact for L=0
+    if core_length_L() <= 0.0:
+        return 2.0 * M
+
+    # Scan to detect sign change
+    r_min = max(1e-6, 0.02 * M)
+    r_max = 6.0 * M
+    Nscan = 256
+    prev_r = r_min
+    prev_f = _f_horizon(prev_r)
+    r_lo, r_hi = None, None
+    for k in range(1, Nscan + 1):
+        r = r_min + (r_max - r_min) * (k / Nscan)
+        f = _f_horizon(r)
+        if prev_f * f <= 0.0:  # sign change (or exact zero)
+            r_lo, r_hi = prev_r, r
+            break
+        prev_r, prev_f = r, f
+
+    if r_lo is None:
+        # No sign change detected — likely no horizon; graceful fallback
+        return 2.0 * M
+
+    # Bisection refine
+    for _ in range(64):
+        mid = 0.5 * (r_lo + r_hi)
+        fm  = _f_horizon(mid)
+        if abs(fm) < 1e-12:
+            return max(mid, 1e-6)
+        if _f_horizon(r_lo) * fm <= 0.0:
+            r_hi = mid
+        else:
+            r_lo = mid
+    return max(0.5 * (r_lo + r_hi), 1e-6)
+
+def update_scales():
+    """Derive BH_M, rs and refined r_h (capture) from current settings."""
+    global BH_M, rs, r_h
+    BH_M = BASE_M * BH_SIZE_SCALE
+    rs   = 2.0 * BH_M
+    # refined horizon if deformation is enabled; otherwise Schwarzschild
+    if ENABLE_CORE_DEFORMATION:
+        r_plus = horizon_radius_float()
+        r_h    = 1.001 * r_plus
+    else:
+        r_h    = 1.001 * rs
+
+# Initialize scales
+update_scales()
+
+if os.getenv("BH_DEBUG", "0") == "1":
+    eps_eff = (core_length_L()/rs) if rs > 0 else 0.0
+    print(
+        "[init] "
+        f"ENABLE_CORE_DEFORMATION={ENABLE_CORE_DEFORMATION}, CORE_MODEL={CORE_MODEL}, "
+        f"L_eff={core_length_L():.6f}, eps_eff={eps_eff:.6f}, "
+        f"rs={rs:.6f}, r_h={r_h:.6f}, b_c={photon_ring_b_critical():.6f}"
+    )
 
 # ========= Value noise + fBm + domain warp =========
 def _hash2(i, j):
@@ -224,7 +394,7 @@ def sky_sample_dirs(dir_world, cam, time_s):
     if VORTEX_STRENGTH != 0.0:                       # ring-anchored swirl
         cam_rep = cam.view(1,1,3).expand_as(d)
         b  = tnorm(torch.cross(cam_rep, d), dim=-1)
-        bc = 3.0*math.sqrt(3.0)*BH_M
+        bc  = photon_ring_b_critical()
         sig = VORTEX_SIGMA_COEF * BH_M
         gain = torch.exp(-0.5*((b - bc)/(sig+1e-6))**2)
         ang  = VORTEX_STRENGTH * time_s * gain
@@ -348,11 +518,22 @@ def render_frame_torch(width, height, time_s, device):
     aspect = width / float(height)
     cam, right, up, fwd = make_camera(device)
 
+    # Fit FOV so the whole disk is visible with a small margin
     t_plane = r_cam / max(math.cos(INCL), 1e-6)
     need    = r_out / max(t_plane, 1e-6)
     FOV_eff = max(BASE_FOV, 2.0*math.atan((1.0 + FIT_MARGIN) * need))
+
     if time_s == 0.0:
-        print(f"FOV_eff: {math.degrees(FOV_eff):.2f}°, cam=({cam[0]:.2f},{cam[1]:.2f},{cam[2]:.2f}), BH_SIZE_SCALE={BH_SIZE_SCALE:.2f}, SEED={SEED}")
+        eps_eff = (core_length_L()/rs) if rs > 0 else 0.0
+        bc = photon_ring_b_critical()
+        print(
+            f"FOV_eff: {math.degrees(FOV_eff):.2f}°, "
+            f"cam=({cam[0]:.2f},{cam[1]:.2f},{cam[2]:.2f}), "
+            f"BH_SIZE_SCALE={BH_SIZE_SCALE:.2f}, SEED={SEED}, "
+            f"model={CORE_MODEL}, eps_eff={eps_eff:.5f}, "
+            f"r_h={r_h:.5f}, b_c={bc:.5f}",
+            flush=True,
+        )
 
     ys = torch.linspace(-math.tan(FOV_eff/2),        math.tan(FOV_eff/2),        height, device=device)
     xs = torch.linspace(-math.tan(FOV_eff/2)*aspect, math.tan(FOV_eff/2)*aspect, width,  device=device)
@@ -362,9 +543,18 @@ def render_frame_torch(width, height, time_s, device):
     r_min     = torch.full((height, width), 1e9, device=device)
 
     for _ in range(max(1, SAMPLES_PER_PIXEL)):
-        dir_world = normalize(fwd.view(1,1,3)
-                              + right.view(1,1,3)*XX.unsqueeze(-1)
-                              +   up.view(1,1,3)*YY.unsqueeze(-1))
+        # Primary rays
+        dir_world = normalize(
+            fwd.view(1,1,3)
+            + right.view(1,1,3)*XX.unsqueeze(-1)
+            + up.view(1,1,3)*YY.unsqueeze(-1)
+        )
+
+        # Impact parameter & azimuth at the camera (constant along the geodesic)
+        b0 = tnorm(torch.cross(cam.view(1,1,3), dir_world), dim=-1)
+        phi_cam = torch.atan2(dir_world[...,1], dir_world[...,0])
+
+        # Ray-march setup
         x = cam.view(1,1,3).expand(height, width, 3).clone()
         u = dir_world.clone()
 
@@ -377,12 +567,16 @@ def render_frame_torch(width, height, time_s, device):
         for _step in range(MAX_STEPS):
             z = x[...,2]
             r_here = tnorm(x, dim=-1)
+
+            # Horizon capture
             fell = (r_here < r_h) & alive
             if fell.any():
                 bhmask[fell] = True
                 alive[fell]  = False
+
             r_min = torch.minimum(r_min, r_here)
 
+            # Detect crossing of the disk plane z=0 and shade the disk
             cross = (z_prev > 0.0) & (z <= 0.0) & alive & (~hitmask)
             if cross.any():
                 t0  = z_prev[cross] / (z_prev[cross] - z[cross] + 1e-12)
@@ -398,7 +592,9 @@ def render_frame_torch(width, height, time_s, device):
                     alive[idx[:,0], idx[:,1]]   = False
 
             adv = alive & (~hitmask)
-            if not adv.any(): break
+            if not adv.any():
+                break
+
             xa = x[adv]; ua = u[adv]
             g = grad_n(xa)
             n = n_of_r(tnorm(xa, dim=-1))
@@ -408,16 +604,12 @@ def render_frame_torch(width, height, time_s, device):
             u[adv] = ua; x[adv] = xa
             z_prev = z
 
+        # Add disk emission (warm colormap)
         if inten.max() > 0:
             I_norm = inten / (inten.max() + 1e-6)
             img_accum += warm_colormap(I_norm, device)
 
-        if ENABLE_PHOTON_RING:
-            bc = 3.0*math.sqrt(3.0)*BH_M
-            ring_sigma = PHOTON_RING_SIGMA_COEF * BH_M
-            ring = torch.exp(-0.5*((r_min - bc)/(ring_sigma+1e-6))**2)
-            img_accum += PHOTON_RING_GAIN * warm_colormap(ring, device)
-
+        # Sample background for all misses (nebula, stars)
         miss = (~hitmask) & (~bhmask)
         if miss.any():
             d_sky = sky_sample_dirs(u, cam, time_s)
@@ -427,11 +619,43 @@ def render_frame_torch(width, height, time_s, device):
             bg = neb_a.unsqueeze(-1) * neb_col + grains + stars
             img_accum[miss] += bg[miss]
 
-    img_accum[(r_min <= r_h + 1e-3)] = 0.0  # force BH black
+        # Photon-ring overlay AFTER bg so it blends with the scene
+        if ENABLE_PHOTON_RING:
+            bc = photon_ring_b_critical()
+            base_sigma = PHOTON_RING_SIGMA_COEF * BH_M
 
+            # small thickness jitter around circumference
+            nphi = noise2(phi_cam*64.0 + 13.7 + 0.017*_SEED_F,
+                          phi_cam*64.0 + 29.3 + 0.019*_SEED_F)
+            sigma = base_sigma * (1.0 + PHOTON_RING_NOISE * (2.0*nphi - 1.0))
+
+            # gaussian core in impact-parameter space
+            core = torch.exp(-0.5 * ((b0 - bc) / (sigma + 1e-6))**2)
+
+            # soft-knee feather
+            alpha = torch.clamp(core, 0.0, 1.0) ** PHOTON_RING_SOFTKNEE
+
+            # subtle warm highlight, but mostly borrow color from what's already there
+            warm = warm_colormap(core, device)
+            tint = torch.tensor(PHOTON_RING_TINT, device=device).view(1,1,3)
+            highlight = warm * tint
+
+            # color that tracks the local background
+            ring_rgb = PHOTON_RING_GAIN * alpha.unsqueeze(-1) * (
+                PHOTON_RING_BG_MIX * img_accum + (1.0 - PHOTON_RING_BG_MIX) * highlight
+            )
+
+            # SCREEN blend: out = 1 - (1 - base) * (1 - ring)
+            img_accum = 1.0 - (1.0 - img_accum) * (1.0 - ring_rgb)
+
+    # Force the captured region black
+    img_accum[(r_min <= r_h + 1e-3)] = 0.0
+
+    # Post-process: normalize, bloom, gamma
     img_np = img_accum.detach().clamp(0, None).cpu().numpy()
     m = img_np.max()
-    if m > 0: img_np /= m
+    if m > 0:
+        img_np /= m
     bright = np.clip(img_np - BLOOM_THRESH, 0, 1)
     for c in range(3):
         bright[..., c] = gaussian_filter(bright[..., c], BLOOM_SIGMA)
@@ -466,6 +690,17 @@ def current_params_dict():
         "NEBULA_COLOR_CYAN": NEBULA_COLOR_CYAN,
         "NEBULA_COLOR_MAGENTA": NEBULA_COLOR_MAGENTA,
         "NEBULA_COLOR_GOLD": NEBULA_COLOR_GOLD,
+        "ENABLE_CORE_DEFORMATION": ENABLE_CORE_DEFORMATION,
+        "CORE_MODEL": CORE_MODEL,
+        "CORE_EPSILON": CORE_EPSILON,
+        "CORE_L0": CORE_L0,
+        "CORE_CF": CORE_CF,
+        "CORE_CTAU": CORE_CTAU,
+        "rs": rs,
+        "r_h": r_h,
+        "CORE_L_effective": core_length_L(),
+        "CORE_eps_effective": (core_length_L()/rs if rs > 0 else 0.0),
+        "b_c_critical": photon_ring_b_critical(),
     }
 
 def set_nebula_colors(cyan: Optional[List[float]] = None,
@@ -493,6 +728,8 @@ def apply_params(params: dict) -> None:
     global NEBULA_CLOUD_SIZE, NEBULA_GRAININESS
     global SKY_ROT_RATE, VORTEX_STRENGTH, VORTEX_SIGMA_COEF, NEBULA_FLOW_RATE
     global WARP_TIME_RATE, TWINKLE_RATE
+    global ENABLE_CORE_DEFORMATION, CORE_MODEL, CORE_EPSILON, CORE_L0, CORE_CF, CORE_CTAU
+
     for k, v in (params or {}).items():
         if k == "NEBULA_COLOR_CYAN":
             set_nebula_colors(cyan=v)
@@ -500,18 +737,24 @@ def apply_params(params: dict) -> None:
             set_nebula_colors(magenta=v)
         elif k == "NEBULA_COLOR_GOLD":
             set_nebula_colors(gold=v)
-        elif hasattr(globals().__class__, "__call__"):
-            globals()[k] = v
         else:
             globals()[k] = v
-    BH_M  = BASE_M * BH_SIZE_SCALE
-    rs    = 2.0 * BH_M
-    r_h   = 1.001 * rs
-    if isinstance(BAND_ROT, (int, float)):
-        BAND_ROT = float(BAND_ROT)
-    if isinstance(INCL, (int, float)):
-        INCL = float(INCL)
-    # re-derive FOV and related floats
+
+    # Recompute M, rs, and r_h consistently (respects core deformation & horizon solve)
+    update_scales()
+
+    if os.getenv("BH_DEBUG", "0") == "1":
+        eps_eff = (core_length_L()/rs) if rs > 0 else 0.0
+        print(
+            "[apply_params] "
+            f"ENABLE_CORE_DEFORMATION={ENABLE_CORE_DEFORMATION}, CORE_MODEL={CORE_MODEL}, "
+            f"L_eff={core_length_L():.6f}, eps_eff={eps_eff:.6f}, "
+            f"rs={rs:.6f}, r_h={r_h:.6f}, b_c={photon_ring_b_critical():.6f}"
+        )
+
+    # keep scalar types sane
+    if isinstance(BAND_ROT, (int, float)): BAND_ROT = float(BAND_ROT)
+    if isinstance(INCL, (int, float)):     INCL     = float(INCL)
     BASE_FOV = float(BASE_FOV)
 
 def render_image(width: int, height: int, time_s: float, device: Optional[str] = None):
