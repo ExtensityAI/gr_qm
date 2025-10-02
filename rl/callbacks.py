@@ -41,6 +41,17 @@ class MetricsCallback(BaseCallback):
                 self.logger.record("env/param", float(info["param"]))
             if "has_horizon" in info:
                 self.logger.record("env/has_horizon", 1.0 if bool(info["has_horizon"]) else 0.0)
+            # Difficulty-specific metrics
+            if "difficulty" in info:
+                d = str(info["difficulty"]).upper()
+                self.logger.record("env/is_medium", 1.0 if d == "MEDIUM" else 0.0)
+                self.logger.record("env/is_hard", 1.0 if d == "HARD" else 0.0)
+            if "fidelity_high" in info:
+                self.logger.record("env/fidelity_high", 1.0 if bool(info["fidelity_high"]) else 0.0)
+            if "step_cost" in info:
+                self.logger.record("env/step_cost", float(info["step_cost"]))
+            if "budget" in info:
+                self.logger.record("env/budget", float(info["budget"]))
         return True
 
 

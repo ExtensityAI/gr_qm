@@ -104,25 +104,54 @@ def _autobootstrap_target_if_empty(target: TargetSpec, env_conf: EnvConfig) -> T
     )
 
 
+def _get_preset_overrides(cfg) -> tuple[dict, dict]:
+    prof = getattr(cfg, "difficulty_profile", None)
+    if not prof:
+        return {}, {}
+    presets = getattr(cfg, "difficulty_presets", {})
+    if prof not in presets:
+        return {}, {}
+    env_over = dict(presets[prof].get("env", {}))
+    ppo_over = dict(presets[prof].get("ppo", {}))
+    return env_over, ppo_over
+
+
 def _build_env_config(cfg) -> EnvConfig:
     e = cfg.env
+    env_over, _ = _get_preset_overrides(cfg)
+    def gv(name, default=None):
+        return env_over.get(name, e.get(name, default))
     return EnvConfig(
-        core_model=e.core_model,
-        eps_min=e.eps_min,
-        eps_max=e.eps_max,
-        L0_min=e.L0_min,
-        L0_max=e.L0_max,
-        max_steps=e.max_steps,
-        chi2_converged=e.chi2_converged,
-        step_size=e.step_size,
-        use_loglike_reward=e.use_loglike_reward,
-        render_width=e.render_width,
-        render_height=e.render_height,
-        render_device=e.render_device,
-        enable_render_overlays=e.enable_render_overlays,
-        init_center_eps=e.init_center_eps,
-        init_spread=e.init_spread,
-        default_M_solar=e.default_M_solar,
+        core_model=gv("core_model"),
+        eps_min=gv("eps_min"),
+        eps_max=gv("eps_max"),
+        L0_min=gv("L0_min"),
+        L0_max=gv("L0_max"),
+        max_steps=gv("max_steps"),
+        chi2_converged=gv("chi2_converged"),
+        step_size=gv("step_size"),
+        use_loglike_reward=gv("use_loglike_reward"),
+        render_width=gv("render_width"),
+        render_height=gv("render_height"),
+        render_device=gv("render_device"),
+        enable_render_overlays=gv("enable_render_overlays"),
+        init_center_eps=gv("init_center_eps"),
+        init_spread=gv("init_spread"),
+        default_M_solar=gv("default_M_solar"),
+        difficulty=gv("difficulty", "LOW"),
+        fidelity_low_noise_mult=gv("fidelity_low_noise_mult"),
+        fidelity_high_noise_mult=gv("fidelity_high_noise_mult"),
+        fidelity_low_step_cost=gv("fidelity_low_step_cost"),
+        fidelity_high_step_cost=gv("fidelity_high_step_cost"),
+        budget_init=gv("budget_init"),
+        cost_weight=gv("cost_weight"),
+        cost_query_f220=gv("cost_query_f220"),
+        cost_query_tau220=gv("cost_query_tau220"),
+        cost_query_theta=gv("cost_query_theta"),
+        cost_query_bc=gv("cost_query_bc"),
+        hard_terminal_full_eval=gv("hard_terminal_full_eval"),
+        include_masks_in_obs=gv("include_masks_in_obs"),
+        hard_noise_scale=gv("hard_noise_scale"),
     )
 
 
@@ -167,6 +196,7 @@ def main(cfg: DictConfig) -> float:
         )
 
     # PPO model
+    env_over, ppo_over = _get_preset_overrides(cfg)
     ppo_cfg = cfg.ppo
     policy_kwargs = dict(
         net_arch=ppo_cfg.net_arch,
@@ -175,16 +205,16 @@ def main(cfg: DictConfig) -> float:
     model = PPO(
         ppo_cfg.policy,
         venv,
-        learning_rate=ppo_cfg.learning_rate,
-        n_steps=ppo_cfg.n_steps,
-        batch_size=ppo_cfg.batch_size,
-        n_epochs=ppo_cfg.n_epochs,
-        gamma=ppo_cfg.gamma,
-        gae_lambda=ppo_cfg.gae_lambda,
-        clip_range=ppo_cfg.clip_range,
-        ent_coef=ppo_cfg.ent_coef,
-        vf_coef=ppo_cfg.vf_coef,
-        max_grad_norm=ppo_cfg.max_grad_norm,
+        learning_rate=ppo_over.get("learning_rate", ppo_cfg.learning_rate),
+        n_steps=ppo_over.get("n_steps", ppo_cfg.n_steps),
+        batch_size=ppo_over.get("batch_size", ppo_cfg.batch_size),
+        n_epochs=ppo_over.get("n_epochs", ppo_cfg.n_epochs),
+        gamma=ppo_over.get("gamma", ppo_cfg.gamma),
+        gae_lambda=ppo_over.get("gae_lambda", ppo_cfg.gae_lambda),
+        clip_range=ppo_over.get("clip_range", ppo_cfg.clip_range),
+        ent_coef=ppo_over.get("ent_coef", ppo_cfg.ent_coef),
+        vf_coef=ppo_over.get("vf_coef", ppo_cfg.vf_coef),
+        max_grad_norm=ppo_over.get("max_grad_norm", ppo_cfg.max_grad_norm),
         tensorboard_log=cfg.logging.tensorboard_dir,
         policy_kwargs=policy_kwargs,
         device=cfg.device,
@@ -231,7 +261,7 @@ def main(cfg: DictConfig) -> float:
     # Train
     total_timesteps = int(cfg.train.total_timesteps)
     # Name the TB run for easier comparison
-    tb_name = f"ppo_seed{seed}_nenv{n_envs}"
+    tb_name = f"ppo_{_build_env_config(cfg).difficulty.lower()}_seed{seed}_nenv{n_envs}"
     model.learn(total_timesteps=total_timesteps,
                 callback=callbacks,
                 progress_bar=cfg.train.progress_bar,

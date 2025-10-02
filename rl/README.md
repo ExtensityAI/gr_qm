@@ -96,6 +96,14 @@ r = -\frac{1}{2}\chi^2, \quad \text{where }\chi^2=\sum_k \left(\frac{\Delta_k}{\
 \]
 If a σ is not provided, \( \sigma_k=1 \) is used (unit-weight). Set `env.use_loglike_reward=false` to use `-χ²`.
 
+### Difficulty Modes (LOW | MEDIUM | HARD)
+The environment supports progressively harder settings via `env.difficulty`:
+- `LOW` (default): legacy behavior — 1D action (Δparam), smooth objective, no costs.
+- `MEDIUM`: adds multi-fidelity control; action is 2D `[Δparam, fidelity_ctrl]`, per-step fidelity cost added; observations include fidelity flag and normalized budget placeholder.
+- `HARD`: adds query selection and budget; action is 3D `[Δparam, fidelity_ctrl, query_ctrl]` where query discretizes to {f220, tau220, theta, bc, terminate}. Observations include acquired residuals with fixed noise, masks, fidelity flag, and normalized budget.
+
+Key env fields (see `config.yaml`): `difficulty`, `cost_weight`, fidelity noise/costs, `budget_init`, `hard_terminal_full_eval`, `include_masks_in_obs`.
+
 ### Termination / Truncation
 - `terminated` when `chi2 <= env.chi2_converged` (solved to a precision).
 - `truncated` when `step_count >= env.max_steps`.
@@ -132,6 +140,8 @@ The master config lives in `conf/config.yaml`. You can override any value on the
 | `chi2_converged` | float | `1e-2` | Success threshold on χ² |
 | `step_size` | float | `0.01` | Scales delta action in native units |
 | `use_loglike_reward` | bool | `true` | Use `-0.5*χ²` if true; else `-χ²` |
+| `difficulty` | str | `LOW` | Difficulty: `LOW`, `MEDIUM`, `HARD` |
+| Fidelity and cost params | — | see file | Multi-fidelity costs/noise, query costs, budget |
 | `render_width,height` | int | `256, 144` | Cheap render size (debug only) |
 | `render_device` | str | `cpu` | Renderer device for debug previews |
 | `enable_render_overlays` | bool | `false` | Keep false for speed |
@@ -179,6 +189,9 @@ Provide any subset; residuals computed only for the values you set.
 | `eval_freq` | `10000` | Steps between evals |
 | `n_episodes` | `10` | Per-eval rollouts |
 
+Evaluate a saved model with a profile:
+- `python eval.py --model-dir models --episodes 20 --profile hard`
+
 ### `vecnormalize`
 | Key | Default | Notes |
 |---|---:|---|
@@ -198,6 +211,16 @@ All paths are relative to the Hydra run dir.
 | `checkpoint_dir` | `checkpoints` | Periodic model checkpoints |
 | `best_model_dir` | `best` | Best-by-eval model |
 | `eval_log_dir` | `eval_logs` | Eval callback logs |
+
+### Difficulty Presets
+`config.yaml` includes `difficulty_presets` and a `difficulty_profile` selector:
+- `difficulty_profile: medium` applies MEDIUM env settings and suggests PPO tweaks (e.g., `ent_coef`).
+- `difficulty_profile: hard` applies HARD env, budgeted queries, and PPO tweaks (longer rollouts).
+
+Use from CLI (Hydra overrides):
+- MEDIUM: `python train.py difficulty_profile=medium`
+- HARD: `python train.py difficulty_profile=hard`
+Or set `env.difficulty=MEDIUM|HARD` directly with manual overrides.
 | `model_dir` | `models` | Final model & summary JSON |
 
 ### `checkpoint`
@@ -375,3 +398,36 @@ Smoothing and resampling options:
   - Domain: `--resample-domain overlap|union` (default `overlap`)
 
 Outputs are saved in `outputs/aggregates/` as CSVs and PNGs, plus a `summary.json` with discovered runs and metrics.
+
+---
+
+## Sweeps (Optuna) with Difficulty
+
+Run Optuna sweeps over PPO and env parameters, including difficulty:
+
+- General sweep (searches env.difficulty across LOW/MEDIUM/HARD):
+  - `python train.py -m hydra/sweeper=optuna hydra.sweeper.n_trials=40`
+- Fix difficulty to MEDIUM (restricts search to MEDIUM):
+  - `python train.py -m hydra/sweeper=optuna env.difficulty=MEDIUM hydra.sweeper.n_trials=40`
+- Fix difficulty to HARD and expand rollout length candidates:
+  - `python train.py -m hydra/sweeper=optuna env.difficulty=HARD ppo.n_steps=4096,6144,8192 hydra.sweeper.n_trials=40`
+
+Profiles (templates):
+- Medium template ranges: see `optuna_medium.yaml`
+- Hard template ranges: see `optuna_hard.yaml`
+
+You can copy these ranges into CLI overrides, e.g. (MEDIUM):
+- `python train.py -m hydra/sweeper=optuna env.difficulty=MEDIUM \
+    ppo.n_steps=2048,4096 ppo.batch_size=64,128 ppo.ent_coef=interval(0.005,0.02) \
+    env.cost_weight=interval(0.01,0.08) env.fidelity_high_step_cost=0.5,1.0 \
+    env.fidelity_low_step_cost=0.0,0.5 hydra.sweeper.n_trials=40`
+
+And for HARD:
+- `python train.py -m hydra/sweeper=optuna env.difficulty=HARD \
+    ppo.n_steps=4096,6144,8192 ppo.ent_coef=interval(0.01,0.05) ppo.gamma=interval(0.99,0.999) \
+    env.cost_weight=interval(0.02,0.10) env.budget_init=10.0,20.0,30.0 \
+    env.fidelity_high_step_cost=1.0,2.0 hydra.sweeper.n_trials=60`
+
+Notes:
+- optuna.yaml defines search spaces for PPO (LR, n_steps, batch_size, etc.) and MEDIUM/HARD env cost knobs.
+- For fair comparisons across difficulties, prefer using the same total_timesteps and similar n_envs.

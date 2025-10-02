@@ -27,6 +27,21 @@ env:
   init_center_eps: 0.05
   init_spread: 0.03
   default_M_solar: 70.0
+  # Difficulty mode and extensions
+  difficulty: LOW          # LOW | MEDIUM | HARD
+  fidelity_low_noise_mult: 1.0
+  fidelity_high_noise_mult: 0.25
+  fidelity_low_step_cost: 0.0
+  fidelity_high_step_cost: 1.0
+  budget_init: 10.0
+  cost_weight: 0.05
+  cost_query_f220: 1.0
+  cost_query_tau220: 1.0
+  cost_query_theta: 2.0
+  cost_query_bc: 1.5
+  hard_terminal_full_eval: true
+  include_masks_in_obs: true
+  hard_noise_scale: 1.0
 
 # --------- Targets (example ringdown-only; set your data here) ---------
 target:
@@ -88,3 +103,34 @@ checkpoint:
   enabled: true
   save_freq: 50000
   name_prefix: "ppo_blackhole"
+
+# --------- Difficulty Presets ---------
+difficulty_profile: null     # null | medium | hard
+difficulty_presets:
+  medium:
+    env:
+      difficulty: MEDIUM
+      cost_weight: 0.05
+      fidelity_high_step_cost: 1.0
+      fidelity_low_step_cost: 0.0
+      fidelity_low_noise_mult: 1.0
+      fidelity_high_noise_mult: 0.25
+      include_masks_in_obs: true
+    ppo:
+      ent_coef: 0.01
+      n_steps: 2048
+      batch_size: 64
+  hard:
+    env:
+      difficulty: HARD
+      budget_init: 10.0
+      cost_weight: 0.05
+      fidelity_high_step_cost: 1.0
+      fidelity_low_step_cost: 0.0
+      include_masks_in_obs: true
+      hard_terminal_full_eval: true
+      hard_noise_scale: 1.0
+    ppo:
+      ent_coef: 0.02
+      n_steps: 4096
+      batch_size: 64

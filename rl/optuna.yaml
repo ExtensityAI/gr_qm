@@ -12,6 +12,9 @@ hydra:
       consider_endpoints: true
       n_startup_trials: 5
     params:
+      # Difficulty selection
+      env.difficulty: choice(LOW, MEDIUM, HARD)
+      # Core PPO search
       ppo.learning_rate: interval(1e-5, 1e-3)
       ppo.n_steps: choice(1024, 2048, 4096)
       ppo.batch_size: choice(32, 64, 128)
@@ -23,3 +26,9 @@ hydra:
       ppo.max_grad_norm: interval(0.3, 1.0)
       n_envs: choice(2, 4, 8)
       seed: choice(0, 1, 2, 3)
+      # Difficulty-related env params (used in MEDIUM/HARD; benign in LOW)
+      env.cost_weight: interval(0.0, 0.1)
+      env.budget_init: choice(5.0, 10.0, 20.0)
+      env.fidelity_high_step_cost: choice(0.5, 1.0, 2.0)
+      env.fidelity_low_step_cost: choice(0.0, 0.5)
+      env.fidelity_high_noise_mult: choice(0.25, 0.5, 1.0)

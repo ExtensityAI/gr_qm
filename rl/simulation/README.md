@@ -250,3 +250,100 @@ flowchart LR
     W --> A[PPO Agent]
     A -- action Δparam --> P
 ```
+
+
+
+## Difficulty Modes
+
+The environment supports three difficulty levels that progressively transform the problem
+from a smooth single-shot fit into a **sequential decision process**. LOW keeps backward
+compatibility; MEDIUM and HARD introduce discrete controls and costs where plain log-likelihood
+optimizers are brittle.
+
+### LOW / SIMPLE (default; backward-compatible)
+- **Action**: `shape=(1,)` → `[Δparam]` (Δε or ΔL0 in native units after scaling by `step_size`).
+- **Reward**: `-0.5·χ²` (or `-χ²` when `use_loglike_reward=false`).
+- **Observation**: `[ param_norm ; standardized residuals...]`.
+- **Use case**: sanity checks, comparisons against direct likelihood maximization.
+
+### MEDIUM (multi‑fidelity + compute cost)
+- **Action**: `shape=(2,)` → `[Δparam, fidelity_ctrl]`, where `fidelity_ctrl>0 ⇒ high`, else low.
+- **Reward**: `-0.5·χ²  - λ·cost_fidelity` (λ = `env.cost_weight`).
+- **Observation**: `[ param_norm ; residuals... ; fidelity_flag ; budget_norm(=1.0) ]`.
+- **Why RL**: the objective is piecewise and **non‑differentiable** because fidelity is **discrete**.
+
+**Config knobs**
+- `env.fidelity_low_noise_mult`, `env.fidelity_high_noise_mult` — multiplicative factors for per‑key σ used when sampling fixed measurement noise in HARD (kept for diagnostic consistency in MEDIUM).
+- `env.fidelity_low_step_cost`, `env.fidelity_high_step_cost` — per‑step compute cost.
+- `env.cost_weight` — scales the cost term in the reward.
+
+### HARD (sequential design + queries + budget)
+- **Action**: `shape=(3,)` → `[Δparam, fidelity_ctrl, query_ctrl]`.
+  - `fidelity_ctrl>0 ⇒ high` (costlier, lower noise).
+  - `query_ctrl ∈ [-1,1]` discretized to `{f220, tau220, theta, bc, TERMINATE}`.
+- **State**: set of **acquired** measurements with **fixed noise** sampled at acquisition; a **budget** that decreases with fidelity and queries.
+- **Reward**: `-0.5·χ²_acquired  - λ·(cost_fidelity + cost_query)`; optional **terminal full‑χ²** bonus when terminating.
+- **Observation**: `[param_norm ; residuals(acquired or 0) ; fidelity_flag ; budget_norm ; masks...]` (masks optional).
+
+**Additional knobs**
+- `env.budget_init` — starting budget (units arbitrary but consistent with costs).
+- `env.cost_query_f220/tau220/theta/bc` — per‑query base costs (high fidelity multiplies by 2).
+- `env.hard_terminal_full_eval` — add terminal bonus from full χ² when terminating.
+- `env.include_masks_in_obs` — append acquisition mask bits to the observation.
+- `env.hard_noise_scale` — scales the fixed measurement noise at acquisition.
+
+> ⚠️ **Script compatibility**: existing sanity scripts (`plot_param_sweep.py`, etc.) assume LOW mode.
+> When switching to MEDIUM/HARD the action/observation sizes change; adapt your training/eval scripts accordingly.
+
+
+
+### EnvConfig (selected additions)
+
+| Key | Type | Default | Applies to | Meaning |
+|---|---|---:|---|---|
+| `difficulty` | `LOW\|MEDIUM\|HARD` | `LOW` | all | Difficulty mode |
+| `fidelity_low_noise_mult` | float | `1.0` | MEDIUM/HARD | σ multiplier at low fidelity |
+| `fidelity_high_noise_mult` | float | `0.25` | MEDIUM/HARD | σ multiplier at high fidelity |
+| `fidelity_low_step_cost` | float | `0.0` | MEDIUM/HARD | Per-step cost at low fidelity |
+| `fidelity_high_step_cost` | float | `1.0` | MEDIUM/HARD | Per-step cost at high fidelity |
+| `cost_weight` | float | `0.05` | MEDIUM/HARD | Reward penalty scale for costs |
+| `budget_init` | float | `10.0` | HARD | Starting budget |
+| `cost_query_f220` | float | `1.0` | HARD | Query cost for `f220` |
+| `cost_query_tau220` | float | `1.0` | HARD | Query cost for `tau220` |
+| `cost_query_theta` | float | `2.0` | HARD | Query cost for `theta` |
+| `cost_query_bc` | float | `1.5` | HARD | Query cost for `b_c` |
+| `hard_terminal_full_eval` | bool | `true` | HARD | Terminal full‑χ² adjustment |
+| `include_masks_in_obs` | bool | `true` | HARD | Add acquisition masks to obs |
+| `hard_noise_scale` | float | `1.0` | HARD | Scales fixed measurement noise |
+
+
+
+### Examples: switching difficulty
+
+```python
+from simulation.bh_gym_env import BlackHoleParamEnv, EnvConfig, TargetSpec
+
+# LOW (unchanged)
+env = BlackHoleParamEnv(target, EnvConfig(difficulty="LOW"))
+
+# MEDIUM (multi-fidelity)
+cfg = EnvConfig(difficulty="MEDIUM", cost_weight=0.05,
+                fidelity_low_step_cost=0.0, fidelity_high_step_cost=1.0)
+env = BlackHoleParamEnv(target, cfg)
+
+# HARD (queries + budget)
+cfg = EnvConfig(difficulty="HARD", budget_init=10.0, cost_weight=0.05,
+                cost_query_f220=1.0, cost_query_tau220=1.0,
+                cost_query_theta=2.0, cost_query_bc=1.5)
+env = BlackHoleParamEnv(target, cfg)
+```
+
+
+
+## Dependencies
+
+- `python>=3.10`, `numpy`, `gymnasium`
+- `torch` (for the simulator and any learning code)
+- `stable-baselines3` (for PPO examples)
+- `matplotlib` (for `plot_param_sweep.py`)
+
