@@ -44,8 +44,9 @@ NEBULA_COLOR_MAGENTA = [0.98, 0.20, 0.92]
 NEBULA_COLOR_GOLD    = [1.00, 0.85, 0.25]
 
 # ========= Determinism =========
-SEED = 1337          # <<< set this and keep it fixed to reproduce exactly
-RUN_NAME = "default" # to separate outputs for different experiments (optional)
+QUIET    = False
+SEED     = 1337          # <<< set this and keep it fixed to reproduce exactly
+RUN_NAME = "default"     # to separate outputs for different experiments (optional)
 
 def seed_everything(seed: int):
     random.seed(seed)
@@ -66,7 +67,6 @@ _HASH_A = 12.9898 + 0.000173 * SEED
 _HASH_B = 78.233  + 0.000271 * SEED
 _HASH_C = 43758.5453
 _SEED_F = float(SEED)
-
 
 # ========= Controls =========
 DURATION = 20.0          # seconds of animation to render (used for timing + audio)
@@ -548,14 +548,13 @@ def render_frame_torch(width, height, time_s, device):
     bc = photon_ring_b_critical()
     if time_s == 0.0:
         eps_eff = (core_length_L()/rs) if rs > 0 else 0.0
-        print(
-            f"FOV_eff: {math.degrees(FOV_eff):.2f}°, "
-            f"cam=({cam[0]:.2f},{cam[1]:.2f},{cam[2]:.2f}), "
-            f"BH_SIZE_SCALE={BH_SIZE_SCALE:.2f}, SEED={SEED}, "
-            f"model={CORE_MODEL}, eps_eff={eps_eff:.5f}, "
-            f"r_h={r_h:.5f}, b_c={bc:.5f}",
-            flush=True,
-        )
+        if (not QUIET) and time_s == 0.0:
+            print(
+                f"FOV_eff: {math.degrees(FOV_eff):.2f}°, "
+                f"cam=({cam[0]:.2f},{cam[1]:.2f},{cam[2]:.2f}), "
+                f"BH_SIZE_SCALE={BH_SIZE_SCALE:.2f}, SEED={SEED}, "
+                f"model={CORE_MODEL}, eps_eff={eps_eff:.5f}, r_h={r_h:.5f}, b_c={bc:.5f}"
+            )
 
     # Screen-space ray directions
     ys = torch.linspace(-math.tan(FOV_eff/2),        math.tan(FOV_eff/2),        height, device=device)
@@ -937,3 +936,137 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+# ==============================
+# === RL-friendly extensions ===
+# ==============================
+# (Minimal additions that DO NOT alter existing behavior; only new helpers.)
+# These expose fast, non-rendering observables and physically grounded baselines
+# for use in Gymnasium environments or other optimization loops.
+
+# ---- Physical constants (SI) ----
+_C_c      = 299_792_458.0                      # m/s
+_C_G      = 6.67430e-11                        # m^3 kg^-1 s^-2
+_C_Msun   = 1.98847e30                         # kg
+_C_G_over_c3 = _C_G / (_C_c**3)                # s/kg
+_C_c3_over_G = (_C_c**3) / _C_G                # kg/s
+
+# ---- Schwarzschild l=2,n=0 QNM (Berti et al.) ----
+# Dimensionless frequency: omega M = 0.37367168 - 0.08896232 i  (geometric units: G=c=1).
+_QNM_220_RE = 0.37367168
+_QNM_220_IM = 0.08896232
+
+def qnm_220_baseline(M_solar: float) -> tuple[float, float]:
+    """
+    Baseline (no-core) Schwarzschild 220-mode:
+      f0(M)  [Hz] and tau0(M) [s], using omega M as above and exact mass scaling.
+    """
+    if M_solar <= 0:
+        raise ValueError("M_solar must be positive.")
+    M_kg = M_solar * _C_Msun
+    # Geometric unit mapping: frequency_Hz = (Re(omega) / (2π)) * c^3 / (G M)
+    f0   = (_QNM_220_RE / (2.0 * math.pi)) * (_C_c3_over_G / M_kg)
+    # Damping time: tau = (1/|Im(omega)|) * (G M / c^3)
+    tau0 = (1.0 / _QNM_220_IM) * (_C_G_over_c3 * M_kg)
+    return float(f0), float(tau0)
+
+def qnm_220_with_core(M_solar: float) -> tuple[float, float]:
+    """
+    QNM 220-mode including cubic core response from the paper:
+        δf/f   = CORE_CF   * (L/rs)^3
+        δτ/τ   = CORE_CTAU * (L/rs)^3
+    Uses current global CORE_* settings for eps = L/rs (fractional or absolute).
+    """
+    f0, tau0 = qnm_220_baseline(M_solar)
+    eps = (core_length_L()/rs) if (ENABLE_CORE_DEFORMATION and rs > 0.0) else 0.0
+    f   = f0  * (1.0 + CORE_CF   * (eps**3))
+    tau = tau0 * (1.0 + CORE_CTAU * (eps**3))
+    return float(f), float(tau)
+
+def photon_ring_shadow_diameter(M_solar: float, distance_m: float) -> tuple[float, float]:
+    """
+    Return (b_c, theta_shadow_rad) for a Schwarzschild-like compact object with cubic core correction in b_c.
+      b_c (geometric length in meters) uses current BH_M scale only through the analytic formula
+      b_c ≈ 3√3 M * [1 + (8/27)(L/rs)^3], but converted to SI via GM/c^2.
+    Angular diameter of the shadow (radians) is approx θ_sh ≈ 2 b_c / D for distant observer at distance D.
+    """
+    if M_solar <= 0 or distance_m <= 0:
+        raise ValueError("M_solar and distance_m must be positive.")
+    # Geometric length scale GM/c^2 for given mass:
+    M_kg = M_solar * _C_Msun
+    M_geom_m = _C_G * M_kg / (_C_c**2)  # meters
+    # Effective eps from current core settings
+    eps = (core_length_L()/rs) if (ENABLE_CORE_DEFORMATION and rs > 0.0) else 0.0
+    b_c_dimless = 3.0 * math.sqrt(3.0) * (1.0 + (8.0/27.0) * (eps**3)) # in units of M (geometric)
+    b_c_m = b_c_dimless * M_geom_m
+    theta_shadow = 2.0 * b_c_m / distance_m  # radians
+    return float(b_c_m), float(theta_shadow)
+
+def has_horizon() -> bool:
+    """
+    Try to detect whether a (outer) horizon exists for current core settings.
+    Mirrors the bracketing logic used in horizon_radius_float() and reports success/failure.
+    """
+    M = BH_M
+    # Quick case L=0: Schwarzschild has a horizon at 2M
+    if core_length_L() <= 0.0:
+        return True
+
+    # Scan to detect sign change in f(r)=1-2 m(r)/r
+    r_min = max(1e-6, 0.02 * M)
+    r_max = 6.0 * M
+    Nscan = 256
+    prev_r = r_min
+    prev_f = _f_horizon(prev_r)
+    found  = False
+    for i in range(1, Nscan+1):
+        r = r_min + (r_max - r_min) * (i / Nscan)
+        f = _f_horizon(r)
+        if prev_f * f <= 0.0:
+            found = True
+            break
+        prev_r, prev_f = r, f
+    return found
+
+def bh_observables(M_solar: float,
+                   distance_m: float | None = None) -> dict:
+    """
+    Convenience helper returning standard observables relevant to the paper:
+      - eps, L, rs (scene units)
+      - b_c (meters) and theta_shadow (radians) if distance is provided
+      - f220_Hz and tau220_s for the ringdown
+      - has_horizon boolean
+    """
+    eps_eff = (core_length_L()/rs) if rs > 0.0 else 0.0
+    out = {
+        "eps": float(eps_eff),
+        "L_scene": float(core_length_L()),
+        "rs_scene": float(rs),
+        "has_horizon": bool(has_horizon()),
+    }
+    f, tau = qnm_220_with_core(M_solar)
+    out["f220_Hz"] = float(f)
+    out["tau220_s"] = float(tau)
+    if distance_m is not None:
+        b_c_m, theta = photon_ring_shadow_diameter(M_solar, distance_m)
+        out["b_c_m"] = float(b_c_m)
+        out["theta_shadow_rad"] = float(theta)
+    return out
+
+def set_core_params(eps: float | None = None, L0: float | None = None, model: str | None = None) -> None:
+    """
+    Convenience setter for core parameters. Any argument can be None to keep the current value.
+    - If 'model' is "fractional", 'eps' will be used (0 <= eps <= ~0.2 typical).
+    - If 'model' is "absolute", 'L0' is used (scene units).
+    """
+    params = {}
+    if model is not None:
+        params["CORE_MODEL"] = str(model)
+    if eps is not None:
+        params["CORE_EPSILON"] = float(eps)
+    if L0 is not None:
+        params["CORE_L0"] = float(L0)
+    apply_params(params)
+

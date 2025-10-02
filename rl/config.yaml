@@ -1,0 +1,90 @@
+
+# ======================
+# Hydra + PPO config
+# ======================
+defaults:
+  - _self_
+
+seed: 42
+device: auto
+n_envs: 4
+
+# --------- Environment ---------
+env:
+  core_model: fractional       # fractional | absolute
+  eps_min: 0.0
+  eps_max: 0.15
+  L0_min: 0.0
+  L0_max: 0.6
+  max_steps: 64
+  chi2_converged: 1e-6
+  step_size: 0.02
+  use_loglike_reward: true
+  render_width: 256
+  render_height: 144
+  render_device: cpu
+  enable_render_overlays: false
+  init_center_eps: 0.05
+  init_spread: 0.03
+  default_M_solar: 70.0
+
+# --------- Targets (example ringdown-only; set your data here) ---------
+target:
+  f220_Hz: null          # e.g., 250.1
+  sigma_f_Hz: null       # e.g., 0.5
+  tau220_s: null         # e.g., 0.004
+  sigma_tau_s: null      # e.g., 0.001
+  M_solar: 70.0
+  distance_m: null
+  theta_shadow_rad: null
+  sigma_theta_rad: null
+  b_c_m: null
+  sigma_b_c_m: null
+
+# --------- PPO hyperparameters ---------
+ppo:
+  policy: MlpPolicy
+  learning_rate: 3.0e-4
+  n_steps: 2048
+  batch_size: 64
+  n_epochs: 10
+  gamma: 0.995
+  gae_lambda: 0.95
+  clip_range: 0.2
+  ent_coef: 0.0
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  net_arch: [256, 256]
+
+# --------- Training control ---------
+train:
+  total_timesteps: 250000
+  progress_bar: true
+
+# --------- Evaluation ---------
+eval:
+  eval_freq: 10000
+  n_episodes: 10
+
+# --------- VecNormalize ---------
+vecnormalize:
+  enabled: true
+  norm_obs: true
+  norm_reward: false
+  clip_obs: 10.0
+  gamma: 0.995
+
+# --------- Logging / Artifacts ---------
+logging:
+  tensorboard_dir: outputs   # TensorBoard logs under repo outputs/
+  monitor_dir: monitors
+  checkpoint_dir: checkpoints
+  best_model_dir: best
+  eval_log_dir: eval_logs
+  model_dir: models
+
+# --------- Checkpointing ---------
+checkpoint:
+  enabled: true
+  save_freq: 50000
+  name_prefix: "ppo_blackhole"
